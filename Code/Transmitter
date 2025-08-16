@@ -1,0 +1,174 @@
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
+#include <LoRa.h>
+#include <TinyGPS++.h>
+#include <SD.h>
+#include <SPI.h>
+#include <MPU6050.h>
+
+#define ss 5
+#define rst 14
+#define dio0 2
+#define rxGPS 16
+#define txGPS 17
+#define PIN_SPI_CS 12
+#define VOLTAGE_PIN 36
+#define EJECTION_PIN_HIGH 26
+#define EJECTION_PIN_LOW 27
+
+Adafruit_BMP280 bmp;
+HardwareSerial GPSSerial(1);
+MPU6050 mpu;
+File myFile;
+String filename;
+
+float baseAltitude;
+float maxBMPAltitude = -10000.0;
+unsigned long startTime;
+bool ejectionFired = false;
+bool firingInProgress = false;
+unsigned long firingStartTime = 0;
+float lastValidLatitude = 0.0;
+float lastValidLongitude = 0.0;
+float lastValidGPSAltitude = NAN;
+float lastValidHDOP = NAN;
+bool gpsDataAvailable = false;
+
+void setup() {
+Serial.begin(115200);
+while (!Serial) delay(100);
+
+pinMode(EJECTION_PIN_HIGH, OUTPUT);
+pinMode(EJECTION_PIN_LOW, OUTPUT);
+digitalWrite(EJECTION_PIN_HIGH, LOW);
+digitalWrite(EJECTION_PIN_LOW, LOW);
+
+bmp.begin(0x76);
+baseAltitude = bmp.readAltitude(1013.25);
+
+GPSSerial.begin(9600, SERIAL_8N1, rxGPS, txGPS);
+
+Wire.begin();
+mpu.initialize();
+mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_16);
+
+if (!mpu.testConnection()) {
+Serial.println("MPU6050 connection failed");
+while (1);
+}
+
+Serial.println("LoRa Sender");
+LoRa.setPins(ss, rst, dio0);
+
+while (!LoRa.begin(433E6)) {
+Serial.println(".");
+delay(500);
+}
+LoRa.setSyncWord(0xA5);
+Serial.println("LoRa Initializing OK!");
+
+if (!SD.begin(PIN_SPI_CS)) {
+Serial.println("SD Card initialization failed!");
+return;
+}
+
+int fileIndex = 1;
+do {
+filename = "/data_" + String(fileIndex) + ".csv";
+fileIndex++;
+} while (SD.exists(filename));
+
+myFile = SD.open(filename, FILE_WRITE);
+if (myFile) {
+Serial.println("New data file created: " + filename);
+myFile.println("Time (s), AccelerationZ (m/s²), BMP Altitude (m), Max BMP Altitude (m), GPS Altitude (m), Latitude, Longitude, HDOP, Voltage (V), Status");
+myFile.close();
+} else {
+Serial.println("Failed to create file");
+}
+
+startTime = millis();
+}
+
+void loop() {
+float bmpAltitude = bmp.readAltitude(1013.25) - baseAltitude;
+
+if (bmpAltitude > maxBMPAltitude) {
+maxBMPAltitude = bmpAltitude;
+}
+
+// Check if the conditions for firing the ejection charge are met
+if (!ejectionFired && (millis() - startTime > 5000) && bmpAltitude >= 50 && (maxBMPAltitude - bmpAltitude) >= 5) {
+firingInProgress = true;
+firingStartTime = millis();
+digitalWrite(EJECTION_PIN_HIGH, HIGH);
+digitalWrite(EJECTION_PIN_LOW, LOW);
+delay(500);  // 0.5-second delay before firing
+ejectionFired = true;
+firingInProgress = false;
+Serial.println("Ejection fired!");
+
+// Ensure the pin goes LOW again after 2 seconds
+delay(2000);
+digitalWrite(EJECTION_PIN_HIGH, LOW);
+}
+
+// Read GPS data
+TinyGPSPlus gps;
+while (GPSSerial.available()) {
+gps.encode(GPSSerial.read());
+}
+
+if (gps.location.isValid()) {
+lastValidLatitude = gps.location.lat();
+lastValidLongitude = gps.location.lng();
+if (gps.altitude.isValid()) {
+lastValidGPSAltitude = gps.altitude.meters();
+}
+if (gps.hdop.isValid()) {
+lastValidHDOP = gps.hdop.hdop();
+}
+gpsDataAvailable = true;
+}
+
+// Read acceleration data from MPU6050
+int16_t ax, ay, az;
+mpu.getAcceleration(&ax, &ay, &az);
+float accelerationZ = az / 32768.0 * 16.0 * 9.80665;
+float voltage = analogRead(VOLTAGE_PIN) * (3.3 / 4095.0) * 3.1;
+
+String status = "Armed";  // Default status to 'Armed'
+if (millis() - startTime <= 5000) {
+status = "Safe";  // Print 'Safe' for the first 5 seconds
+} else if (ejectionFired) {
+status = "Fired";
+}
+
+String csvData = String((millis() - startTime) / 1000.0, 1) + ", " +
+String(accelerationZ, 1) + ", " +
+String(bmpAltitude, 1) + ", " +
+String(maxBMPAltitude, 1) + ", " +
+(isnan(lastValidGPSAltitude) ? "0" : String(lastValidGPSAltitude)) + ", " +
+(gpsDataAvailable ? String(lastValidLatitude, 6) + ", " + String(lastValidLongitude, 6) : "0, 0") + ", " +
+(isnan(lastValidHDOP) ? "0" : String(lastValidHDOP, 1)) + ", " +
+String(voltage, 1) + ", " +
+status;
+
+String statusMessage = "OK";  // Default to OK
+myFile = SD.open(filename, FILE_APPEND);
+if (myFile) {
+myFile.println(csvData + ", " + statusMessage);  // Append status to CSV
+myFile.close();
+} else {
+statusMessage = "Error";  // If file write fails
+Serial.println("Failed to write to file");
+}
+
+// Send CSV data to LoRa with status
+LoRa.beginPacket();
+LoRa.print(csvData + ", " + statusMessage);
+LoRa.endPacket();
+
+// Print CSV data to Serial
+Serial.println(csvData + ", " + statusMessage);
+}
