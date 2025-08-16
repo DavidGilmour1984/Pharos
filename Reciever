@@ -1,0 +1,228 @@
+#include <LoRa.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// OLED display configuration
+#define SCREEN_WIDTH 128    // OLED display width, in pixels
+#define SCREEN_HEIGHT 64    // OLED display height, in pixels
+#define OLED_RESET -1       // Reset pin # (or -1 if sharing Arduino reset pin)
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// LoRa module pins
+#define ss 5
+#define rst 14
+#define dio0 2
+String LoRaData;
+int LoRaRSSI;
+
+// WiFi access point configuration
+const char *apSSID = "DCG Rocket";    // SSID for the ESP32 Access Point
+const char *apPassword = "";         // Password for the Access Point
+const IPAddress apIP(192, 168, 1, 2); // Define the desired IP address for the access point
+
+// Create a web server on port 80
+WebServer server(80);
+
+// Declare variables for data to be displayed
+String formattedTime = "";
+String accelerationZ = "";
+String bmpAltitude = "";
+String gpsAltitude = "";
+String latitude = "";
+String longitude = "";
+String hdop = "";
+
+void setup() {
+Serial.begin(115200);
+
+// Initialize OLED display
+if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+Serial.println(F("SSD1306 allocation failed"));
+for (;;);
+}
+display.clearDisplay();
+display.setTextSize(2);
+display.setTextColor(WHITE);
+display.setCursor(45, 10);
+display.println("DCG");
+display.setCursor(29, 30);
+display.println("Rocket");
+display.display();
+delay(5000);
+
+// Initialize LoRa module
+while (!Serial);
+Serial.println("LoRa Receiver");
+LoRa.setPins(ss, rst, dio0);
+while (!LoRa.begin(433E6)) { // 433E6 - Asia, 866E6 - Europe, 915E6 - North America
+Serial.println(".");
+delay(200); // Reduced delay
+}
+LoRa.setSyncWord(0xA5);
+Serial.println("LoRa Initializing OK!");
+
+// Initialize WiFi access point
+WiFi.softAP(apSSID, apPassword);
+WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+Serial.print("Access Point IP address: ");
+Serial.println(WiFi.softAPIP());
+
+// Define the web server routes
+server.on("/", handleRoot);
+server.on("/data", handleData);
+
+// Start the server
+server.begin();
+Serial.println("HTTP server started");
+}
+
+void loop() {
+int packetSize = LoRa.parsePacket(); // try to parse packet
+if (packetSize) {
+Serial.println("Received packet");
+
+LoRaData = ""; // Clear previous data
+while (LoRa.available()) { // read packet
+LoRaData += (char)LoRa.read();
+}
+LoRaRSSI = LoRa.packetRssi();
+Serial.print("RSSI: "); // print RSSI of packet
+Serial.println(LoRaRSSI);
+Serial.println("");
+
+// Split the received CSV string into individual values
+int firstCommaIndex = LoRaData.indexOf(',');
+int secondCommaIndex = LoRaData.indexOf(',', firstCommaIndex + 1);
+int thirdCommaIndex = LoRaData.indexOf(',', secondCommaIndex + 1);
+int fourthCommaIndex = LoRaData.indexOf(',', thirdCommaIndex + 1);
+int fifthCommaIndex = LoRaData.indexOf(',', fourthCommaIndex + 1);
+int sixthCommaIndex = LoRaData.indexOf(',', fifthCommaIndex + 1);
+int seventhCommaIndex = LoRaData.indexOf(',', sixthCommaIndex + 1);
+
+// Check if all necessary commas are found
+if (firstCommaIndex != -1 && secondCommaIndex != -1 && thirdCommaIndex != -1 && fourthCommaIndex != -1 && fifthCommaIndex != -1 && sixthCommaIndex != -1) {
+String timeSecondsStr = LoRaData.substring(0, firstCommaIndex);
+float timeSeconds = timeSecondsStr.toFloat();
+
+// Calculate hours, minutes, seconds, and milliseconds
+unsigned long milliseconds = (unsigned long)((timeSeconds - floor(timeSeconds)) * 1000);
+unsigned long totalSeconds = (unsigned long)timeSeconds;
+unsigned long secondsPart = totalSeconds % 60;
+unsigned long minutesPart = (totalSeconds / 60) % 60;
+unsigned long hoursPart = totalSeconds / 3600;
+
+// Format time string
+formattedTime = String(hoursPart, DEC) + ":" +
+(minutesPart < 10 ? "0" : "") + String(minutesPart, DEC) + ":" +
+(secondsPart < 10 ? "0" : "") + String(secondsPart, DEC) + "." +
+(milliseconds < 100 ? (milliseconds < 10 ? "00" : "0") : "") + String(milliseconds, DEC);
+
+accelerationZ = LoRaData.substring(firstCommaIndex + 1, secondCommaIndex);
+bmpAltitude = LoRaData.substring(secondCommaIndex + 1, thirdCommaIndex);
+gpsAltitude = LoRaData.substring(thirdCommaIndex + 1, fourthCommaIndex);
+latitude = LoRaData.substring(fourthCommaIndex + 1, fifthCommaIndex);
+longitude = LoRaData.substring(fifthCommaIndex + 1, sixthCommaIndex);
+hdop = LoRaData.substring(sixthCommaIndex + 1, seventhCommaIndex);
+
+// Display data on OLED
+display.clearDisplay();
+display.setTextSize(1);
+display.setTextColor(WHITE);
+display.setCursor(0, 0);
+display.print("Time: ");
+display.println(formattedTime);
+display.print("Acc Z: ");
+display.println(accelerationZ + " m/s/s");
+display.print("Bar Alt: ");
+display.println(bmpAltitude + " m");
+display.print("GPS Alt: ");
+display.println(gpsAltitude + " m");
+display.print("Latt: ");
+display.println(latitude);
+display.print("Long: ");
+display.println(longitude);
+display.print("HDOP: ");
+display.println(hdop);
+display.print("RSSI: ");
+display.println(LoRaRSSI);
+display.display();
+} else {
+// Invalid data format received
+Serial.println("Invalid data format received");
+}
+}
+
+// Handle client requests
+server.handleClient();
+}
+
+// Function to handle the root URL
+void handleRoot() {
+String html = "<!DOCTYPE html><html><head><title>LoRa Data</title>";
+html += "<style>";
+html += "body { background-color: black; font-family: Helvetica; }";
+html += "h1 { font-size: 80px; text-align: center; color: #ff7369; font-family: Helvetica; }"; // Adjust color and font-family here
+html += "table { border-collapse: collapse; width: 100%; margin: 20px 0; }"; // Adjust width here (e.g., width: 50%)
+html += "table, th, td { border: 1px solid white; }";
+html += "th, td { padding: 8px; text-align: left; }";
+html += "#dataTable { font-size: 50px; color: white; }";
+html += "#table { font-size: 45px; font-family: Helvetica; color: #ffffff; }"; // Style for table
+html += "th:nth-child(1), td:nth-child(1) { width: 200px; }"; // Width of first column (Parameter)
+html += "th:nth-child(2), td:nth-child(2) { width: 300px; }"; // Width of second column (Value)
+html += "th:nth-child(3), td:nth-child(3) { width: 200px; }"; // Width of third column (Units)
+html += "</style>";
+html += "<script>";
+html += "function fetchData() {";
+html += "  var xhr = new XMLHttpRequest();";
+html += "  xhr.onreadystatechange = function() {";
+html += "    if (xhr.readyState == 4 && xhr.status == 200) {";
+html += "      var data = JSON.parse(xhr.responseText);";
+html += "      document.getElementById('time').innerHTML = data.time;";
+html += "      document.getElementById('accelerationZ').innerHTML = data.accelerationZ;";
+html += "      document.getElementById('bmpAltitude').innerHTML = data.bmpAltitude;";
+html += "      document.getElementById('gpsAltitude').innerHTML = data.gpsAltitude;";
+html += "      document.getElementById('latitude').innerHTML = data.latitude;";
+html += "      document.getElementById('longitude').innerHTML = data.longitude;";
+html += "      document.getElementById('hdop').innerHTML = data.hdop;";
+html += "      document.getElementById('rssi').innerHTML = data.rssi;";
+html += "    }";
+html += "  };";
+html += "  xhr.open('GET', '/data', true);";
+html += "  xhr.send();";
+html += "}";
+html += "setInterval(fetchData, 100);"; // Update data every second
+html += "</script>";
+html += "</head><body><h1>LoRa Data</h1>";
+html += "<table id='dataTable'>";
+html += "<thead><tr><th>Parameter</th><th>Value</th><th>Unit</th></tr></thead>";
+html += "<tbody id='table'>";
+html += "<tr><td>Time</td><td id='time'></td><td></td></tr>";
+html += "<tr><td>Acc Z</td><td id='accelerationZ'></td><td>m/s/s</td></tr>";
+html += "<tr><td>Bar Alt</td><td id='bmpAltitude'></td><td>m</td></tr>";
+html += "<tr><td>GPS Alt</td><td id='gpsAltitude'></td><td>m</td></tr>";
+html += "<tr><td>Latt</td><td id='latitude'></td><td></td></tr>";
+html += "<tr><td>Long</td><td id='longitude'></td><td></td></tr>";
+html += "<tr><td>HDOP</td><td id='hdop'></td><td></td></tr>";
+html += "<tr><td>RSSI</td><td id='rssi'></td><td>dBm</td></tr>";
+html += "</tbody></table></body></html>";
+server.send(200, "text/html", html);
+}
+
+// Function to handle the data URL
+void handleData() {
+String json = "{";
+json += "\"time\":\"" + formattedTime + "\",";
+json += "\"accelerationZ\":\"" + accelerationZ + "\",";
+json += "\"bmpAltitude\":\"" + bmpAltitude + "\",";
+json += "\"gpsAltitude\":\"" + gpsAltitude + "\",";
+json += "\"latitude\":\"" + latitude + "\",";
+json += "\"longitude\":\"" + longitude + "\",";
+json += "\"hdop\":\"" + hdop + "\",";
+json += "\"rssi\":\"" + String(LoRaRSSI) + "\"";
+json += "}";
+server.send(200, "application/json", json);
+}
